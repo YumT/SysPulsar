@@ -120,8 +120,7 @@ public partial class MainWindow : Window
         Closed += (_, _) =>
         {
             _stop = true;
-            if (_mouseHook != IntPtr.Zero)
-                UnhookWindowsHookEx(_mouseHook);
+            _clickThroughTick?.Stop();
             _usageTick?.Stop();
             _usagePoller?.Dispose();
             _tray?.Dispose();
@@ -176,6 +175,7 @@ public partial class MainWindow : Window
         ShowInTaskbar = true;
         WindowState = System.Windows.WindowState.Normal;
         Activate();
+        UpdateClickThroughStyle(); // 復帰位置と静止カーソルの関係で付け直す
     }
 
     /// <summary>前回の位置・サイズを復元。初回や画面外の場合は中央表示。</summary>
@@ -948,7 +948,12 @@ public partial class MainWindow : Window
         if (msg == WmEnterSizeMove)
             _dragging = true;
         else if (msg == WmExitSizeMove)
+        {
             _dragging = false;
+            UpdateClickThroughStyle(); // ドラッグ/リサイズ終了位置で付け直す
+        }
+        else if (msg is WmMove or WmSize)
+            UpdateClickThroughStyle(); // 静止カーソルと窓の位置関係が変わるため
         else if (msg == WmNcHitTest)
             return HitTest(hwnd, lParam, ref handled);
         else if (msg == WmGetMinMaxInfo)
@@ -975,8 +980,7 @@ public partial class MainWindow : Window
         int right = origin.X + rc.Right, bottom = origin.Y + rc.Bottom;
         if (sx < left || sx >= right || sy < top || sy >= bottom)
             return IntPtr.Zero; // クライアント外は通常処理
-        double dpi = PresentationSource.FromVisual(this)?.CompositionTarget?.TransformToDevice.M11 ?? 1.0;
-        int border = Math.Max(1, (int)(6 * dpi));
+        int border = Math.Max(1, (int)(6 * BarMetrics().Dpi));
         // 縁はリサイズ(最大化中は無効)
         if (WindowState != System.Windows.WindowState.Maximized)
         {
@@ -1017,16 +1021,15 @@ public partial class MainWindow : Window
 
     // ---- クリックスルー(WS_EX_TRANSPARENT の領域別付け外し)----
 
-    private IntPtr _mouseHook;
     private bool _styleClickThrough; // hwnd に現在 WS_EX_TRANSPARENT が付いているか
-    private LowLevelMouseProc? _mouseHookProc; // GC 回収防止のため保持
 
-    /// <summary>クリックスルーを適用する。有効時は WH_MOUSE_LL フックを仕掛け、
-    /// カーソル位置に応じて WS_EX_TRANSPARENT を付け外しする:
+    /// <summary>クリックスルーを適用する。有効時はカーソル位置を定期的に追跡し、
+    /// 位置に応じて WS_EX_TRANSPARENT を付け外しする:
     /// 表示エリアでは付けて背面のウィンドウに操作を通し、ドラッグバーと
     /// リサイズ縁では外して操作可能にする。
     /// (ULW=AllowsTransparency ウィンドウは HTTRANSPARENT が他プロセスに
-    /// 効かないため、WM_NCHITTEST 方式ではなくこの方式を取る)</summary>
+    /// 効かない。WH_MOUSE_LL は本環境でコールバックが呼ばれない事象が
+    /// あったため、低コストなタイマー polling 方式を取る)</summary>
     private void ApplyClickThrough()
     {
         var hwnd = new WindowInteropHelper(this).Handle;
@@ -1034,23 +1037,52 @@ public partial class MainWindow : Window
             return; // hwnd 未作成。Loaded で再適用される
         if (_clickThrough)
         {
-            var pt = new Win32Point();
-            GetCursorPos(ref pt);
-            SetStyleClickThrough(hwnd, !IsInteractivePoint(hwnd, pt.X, pt.Y));
-            if (_mouseHook == IntPtr.Zero)
+            if (_clickThroughTick == null)
             {
-                _mouseHookProc = MouseHookProc;
-                _mouseHook = SetWindowsHookEx(WhMouseLL, _mouseHookProc, GetModuleHandle(null), 0);
+                _clickThroughTick = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(50) };
+                _clickThroughTick.Tick += (_, _) => UpdateClickThroughStyle();
             }
+            _clickThroughTick.Start();
+            UpdateClickThroughStyle();
         }
         else
         {
-            if (_mouseHook != IntPtr.Zero)
-            {
-                UnhookWindowsHookEx(_mouseHook);
-                _mouseHook = IntPtr.Zero;
-            }
+            _clickThroughTick?.Stop();
             SetStyleClickThrough(hwnd, false);
+        }
+    }
+
+    private DispatcherTimer? _clickThroughTick;
+
+    /// <summary>現在のカーソル位置で WS_EX_TRANSPARENT を付け直す。
+    /// タイマー polling に加え、移動/リサイズ/トレイ復帰など位置関係が
+    /// 変わった直後にも呼び、バー上のカーソルなのに TRANSPARENT が残る
+    /// 取りこぼしを防ぐ。</summary>
+    private void UpdateClickThroughStyle()
+    {
+        var hwnd = new WindowInteropHelper(this).Handle;
+        if (hwnd == IntPtr.Zero || !_clickThrough)
+            return;
+        var pt = new Win32Point();
+        GetCursorPos(ref pt);
+        SetStyleClickThrough(hwnd, !IsInteractivePoint(hwnd, pt.X, pt.Y));
+    }
+
+    /// <summary>ドラッグバーの高さ(物理 px)と DPI スケール。
+    /// 混在 DPI のマルチモニタ環境でも係数がずれないよう、
+    /// TransformToDevice ではなく PointToScreen の実測から求める。</summary>
+    private (int HeightPx, double Dpi) BarMetrics()
+    {
+        try
+        {
+            var p0 = DragBar.PointToScreen(new System.Windows.Point(0, 0));
+            var p1 = DragBar.PointToScreen(new System.Windows.Point(0, DragBar.ActualHeight));
+            int h = Math.Max(1, (int)(p1.Y - p0.Y));
+            return (h, DragBar.ActualHeight > 0 ? h / DragBar.ActualHeight : 1.0);
+        }
+        catch (InvalidOperationException)
+        {
+            return (28, 1.0); // 未表示時のフォールバック
         }
     }
 
@@ -1067,11 +1099,11 @@ public partial class MainWindow : Window
         int right = origin.X + rc.Right, bottom = origin.Y + rc.Bottom;
         if (sx < left || sx >= right || sy < top || sy >= bottom)
             return false; // ウィンドウ外
-        double dpi = PresentationSource.FromVisual(this)?.CompositionTarget?.TransformToDevice.M11 ?? 1.0;
+        var (barHeight, dpi) = BarMetrics();
         int border = Math.Max(1, (int)(6 * dpi));
         if (sx - left < border || right - sx <= border || sy - top < border || bottom - sy <= border)
             return true; // リサイズ縁
-        return sy - top < (int)(DragBar.ActualHeight * dpi); // ドラッグバー
+        return sy - top < barHeight; // ドラッグバー
     }
 
     /// <summary>WS_EX_TRANSPARENT の付け外し(変化があるときだけ API を呼ぶ)。</summary>
@@ -1085,25 +1117,12 @@ public partial class MainWindow : Window
             new IntPtr(on ? style | WsExTransparent : style & ~WsExTransparent));
     }
 
-    private IntPtr MouseHookProc(int nCode, IntPtr wParam, IntPtr lParam)
-    {
-        if (nCode >= 0 && wParam.ToInt64() == WmMouseMove)
-        {
-            // MSLLHOOKSTRUCT の先頭は pt(スクリーン座標)
-            var pt = Marshal.PtrToStructure<Win32Point>(lParam);
-            var hwnd = new WindowInteropHelper(this).Handle;
-            if (hwnd != IntPtr.Zero)
-                SetStyleClickThrough(hwnd, !IsInteractivePoint(hwnd, pt.X, pt.Y));
-        }
-        return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
-    }
-
     // ---- クリックスルー・リサイズ・最大化用の Win32 ----
 
     private const int WmNcHitTest = 0x0084;
     private const int WmGetMinMaxInfo = 0x0024;
-    private const int WmMouseMove = 0x0200;
-    private const int WhMouseLL = 14;
+    private const int WmMove = 0x0003;
+    private const int WmSize = 0x0005;
     private const int GwlpExStyle = -20;
     private const long WsExTransparent = 0x20;
     private const int HtLeft = 10;
@@ -1115,8 +1134,6 @@ public partial class MainWindow : Window
     private const int HtBottomLeft = 16;
     private const int HtBottomRight = 17;
     private const int MonitorDefaultToNearest = 2;
-
-    private delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
 
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     private struct Win32Point { public int X; public int Y; }
@@ -1157,13 +1174,4 @@ public partial class MainWindow : Window
     private static extern IntPtr SetWindowLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     private static extern bool GetCursorPos(ref Win32Point lpPoint);
-    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
-    private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelMouseProc lpfn,
-        IntPtr hMod, int dwThreadId);
-    [System.Runtime.InteropServices.DllImport("user32.dll")]
-    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
-    [System.Runtime.InteropServices.DllImport("user32.dll")]
-    private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
-    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
-    private static extern IntPtr GetModuleHandle(string? lpModuleName);
 }
