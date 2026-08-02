@@ -4,10 +4,40 @@
         Title="SysPulsar"
         Width="640" Height="580"
         MinWidth="560" MinHeight="500"
-        Background="#141414"
+        Background="Transparent"
+        AllowsTransparency="True"
+        WindowStyle="None"
         FontFamily="Yu Gothic UI"
         WindowStartupLocation="Manual">
-    <!-- Background 必須: 全表示要素を非表示にしたとき Grid 上の右クリックが
-         ヒットテストをすり抜けてコンテキストメニューが出なくなるのを防ぐ -->
-    <Grid x:Name="Root" Background="#141414"/>
+    <!-- 常に枠なし(AllowsTransparency)で動かし、背景の透けは Root のブラシで制御する。
+         半透明オーバーレイ時は Root を半透明にして背面のウィンドウを見せる。
+         リサイズは縁の WM_NCHITTEST、移動は上部ドラッグバー、最大化は
+         ダブルクリック + WM_GETMINMAXINFO(すべてコードビハインド) -->
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <!-- ドラッグバー: 左=タイトル、右=最小化/閉じる。バーのドラッグで移動、
+             ダブルクリックで最大化切替。ボタン処理はコードビハインド -->
+        <Border x:Name="DragBar" Grid.Row="0" Height="28" Background="#1f1f1f">
+            <DockPanel>
+                <TextBlock x:Name="DragBarClose" Text="×" DockPanel.Dock="Right"
+                           Width="40" FontSize="14" Foreground="#c8c8c8"
+                           HorizontalAlignment="Center" VerticalAlignment="Center"
+                           TextAlignment="Center"/>
+                <TextBlock x:Name="DragBarMinimize" Text="─" DockPanel.Dock="Right"
+                           Width="40" FontSize="11" Foreground="#c8c8c8"
+                           HorizontalAlignment="Center" VerticalAlignment="Center"
+                           TextAlignment="Center"/>
+                <TextBlock Text="SysPulsar" FontSize="11" Foreground="#8a8a8a"
+                           Margin="10,0,0,0" VerticalAlignment="Center"/>
+            </DockPanel>
+        </Border>
+
+        <!-- Background 必須: 全表示要素を非表示にしたとき Grid 上の右クリックが
+             ヒットテストをすり抜けてコンテキストメニューが出なくなるのを防ぐ -->
+        <Grid x:Name="Root" Grid.Row="1" Background="#141414"/>
+    </Grid>
 </Window>

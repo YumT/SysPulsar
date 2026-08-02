@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Interop;
@@ -24,7 +25,6 @@ public partial class MainWindow : Window
     private const int MaxDisks = 10;
     private const int WmEnterSizeMove = 0x0231;
     private const int WmExitSizeMove = 0x0232;
-    private const int WmSettingChange = 0x001A;
 
     private static readonly WpfColor CCpu = Sparkline.Hex("#4fc3f7");
     private static readonly WpfColor CMem = Sparkline.Hex("#ba68c8");
@@ -53,6 +53,17 @@ public partial class MainWindow : Window
     private int _layoutMode = 22;
     private readonly Dictionary<int, MenuItem> _layoutItems = new();
 
+    /// <summary>半透明オーバーレイの不透明度(0.1〜1.0。1.0=不透明)。window-state.json に保存。</summary>
+    private double _overlayOpacity = 1.0;
+    /// <summary>パネル背景の不透明度(0.1〜1.0。1.0=不透明)。window-state.json に保存。</summary>
+    private double _panelOpacity = 1.0;
+    /// <summary>クリックスルー(マウス操作を背面に通す)。window-state.json に保存。</summary>
+    private bool _clickThrough;
+    private readonly Dictionary<double, MenuItem> _overlayItems = new();
+    private readonly Dictionary<double, MenuItem> _panelItems = new();
+    private MenuItem _clickThroughItem = null!;
+    private System.Windows.Forms.ToolStripMenuItem _trayClickThrough = null!;
+
     /// <summary>更新適用項目をメニューに挿入済みか(二重挿入防止)。</summary>
     private bool _updateOffered;
 
@@ -80,11 +91,14 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         _config = AppConfig.Load();
+        SetupDragBar();
+        SetupTrayIcon(); // BuildLayout より先に(トレイのクリックスルー項目に初期状態を反映するため)
         BuildLayout();
-        SetupTrayIcon();
         Loaded += (_, _) =>
         {
             RestoreWindowState();
+            ApplyOverlay(); // 復元したオーバーレイの濃さを反映
+            ApplyClickThrough(); // hwnd 作成後にクリックスルーを反映
             StartThreads();
         };
         // ×ボタンは終了ではなくトレイへ退避(常駐)。完全終了はトレイメニューから。
@@ -106,6 +120,8 @@ public partial class MainWindow : Window
         Closed += (_, _) =>
         {
             _stop = true;
+            if (_mouseHook != IntPtr.Zero)
+                UnhookWindowsHookEx(_mouseHook);
             _usageTick?.Stop();
             _usagePoller?.Dispose();
             _tray?.Dispose();
@@ -120,6 +136,13 @@ public partial class MainWindow : Window
     {
         var menu = new System.Windows.Forms.ContextMenuStrip();
         menu.Items.Add("開く", null, (_, _) => RestoreFromTray());
+        // クリックスルー有効中はウィンドウ上の右クリックも背面に通るため、解除はここから行う
+        _trayClickThrough = new System.Windows.Forms.ToolStripMenuItem("クリックスルー")
+        {
+            CheckOnClick = true,
+        };
+        _trayClickThrough.CheckedChanged += (_, _) => SetClickThrough(_trayClickThrough.Checked);
+        menu.Items.Add(_trayClickThrough);
         menu.Items.Add("終了", null, (_, _) =>
         {
             _reallyExit = true;
@@ -270,6 +293,29 @@ public partial class MainWindow : Window
             SaveWindowState();
         };
         Root.ContextMenu.Items.Add(topmostToggle);
+
+        // 半透明オーバーレイ。背景(ウィンドウの下地)とパネルで濃さを個別に設定する
+        // (10%〜100% の 10% 刻みで 100%=不透明。背景は Root の下地ブラシ、
+        // パネルは各ブロックの Opacity)
+        _overlayOpacity = NormalizeOpacity(saved?.OverlayOpacity);
+        _panelOpacity = NormalizeOpacity(saved?.PanelOpacity);
+        var overlayMenu = new MenuItem { Header = "半透明オーバーレイ" };
+        overlayMenu.Items.Add(MakeOpacitySubmenu("背景 (ウィンドウ)", _overlayOpacity, _overlayItems, SetOverlayOpacity));
+        overlayMenu.Items.Add(MakeOpacitySubmenu("パネル", _panelOpacity, _panelItems, SetPanelOpacity));
+        Root.ContextMenu.Items.Add(overlayMenu);
+
+        // クリックスルー(有効中は右クリックも背面に通るため、解除はトレイメニューから。
+        // 状態は window-state.json に保存し次回起動時に復元)
+        _clickThrough = saved?.ClickThrough ?? false;
+        _clickThroughItem = new MenuItem
+        {
+            Header = "クリックスルー (マウス操作を背面に通す)",
+            IsCheckable = true,
+            IsChecked = _clickThrough,
+        };
+        _clickThroughItem.Click += (_, _) => SetClickThrough(_clickThroughItem.IsChecked);
+        Root.ContextMenu.Items.Add(_clickThroughItem);
+        _trayClickThrough.Checked = _clickThrough; // トレイ側にも初期状態を反映
         Root.ContextMenu.Items.Add(new Separator());
 
         // AI Usage の Claude / Kimi 個別の表示切替(デフォルト両方表示。
@@ -303,6 +349,8 @@ public partial class MainWindow : Window
             Topmost = Topmost, Layout = _layoutMode,
             ShowMetrics = _showMetrics, ShowProcesses = _showProcesses,
             ShowDisks = _showDisks, ShowUsage = _showUsage,
+            OverlayOpacity = _overlayOpacity, ClickThrough = _clickThrough,
+            PanelOpacity = _panelOpacity,
         });
 
     /// <summary>表示エリアを切り替える(右クリックメニュー「表示エリア」から)。</summary>
@@ -313,6 +361,126 @@ public partial class MainWindow : Window
             item.IsChecked = m == mode;
         ApplyLayout();
         SaveWindowState();
+    }
+
+    /// <summary>背景/パネルの透けサブメニュー(10%〜100% の 10% 刻み排他選択)を作る。</summary>
+    private static MenuItem MakeOpacitySubmenu(string header, double current,
+        Dictionary<double, MenuItem> items, Action<double> setter)
+    {
+        var menu = new MenuItem { Header = header };
+        for (int i = 1; i <= 10; i++)
+        {
+            double v = i / 10.0;
+            var item = new MenuItem { Header = $"{i * 10}%", IsCheckable = true, IsChecked = current == v };
+            double value = v;
+            item.Click += (_, _) => setter(value);
+            menu.Items.Add(item);
+            items[v] = item;
+        }
+        return menu;
+    }
+
+    /// <summary>背景(ウィンドウの下地)の不透明度を切り替える(0.1〜1.0)。</summary>
+    private void SetOverlayOpacity(double value)
+    {
+        _overlayOpacity = value;
+        foreach (var (v, item) in _overlayItems)
+            item.IsChecked = v == value;
+        ApplyOverlay();
+        SaveWindowState();
+    }
+
+    /// <summary>パネル背景の不透明度を切り替える(0.1〜1.0)。</summary>
+    private void SetPanelOpacity(double value)
+    {
+        _panelOpacity = value;
+        foreach (var (v, item) in _panelItems)
+            item.IsChecked = v == value;
+        ApplyOverlay();
+        SaveWindowState();
+    }
+
+    /// <summary>クリックスルーを切り替える(右クリックメニュー/トレイメニューのどちらからも来る)。
+    /// ウィンドウ側・トレイ側の両メニュー項目のチェック状態を同期する。
+    /// 起動時の初期同期(トレイ項目への Checked 設定)では状態が変わらないので何もしない。</summary>
+    private void SetClickThrough(bool enabled)
+    {
+        if (_clickThrough == enabled)
+            return;
+        _clickThrough = enabled;
+        _clickThroughItem.IsChecked = enabled;
+        _trayClickThrough.Checked = enabled;
+        ApplyClickThrough();
+        SaveWindowState();
+    }
+
+    /// <summary>半透明オーバーレイを適用する。ウィンドウは常に AllowsTransparency
+    /// (枠なし・背景 Transparent)で動くため、Root の下地ブラシと各ブロック
+    /// (メトリクス/プロセス＆イベント/ドライブ/AI Usage)の Opacity を変えるだけで
+    /// 背面のウィンドウが見える。背景は下地とドラッグバーの地色、パネルは
+    /// 背景・文字・グラフごと透ける。100% は不透明。</summary>
+    private void ApplyOverlay()
+    {
+        Root.Background = TintBrush("#141414", _overlayOpacity);
+        // ドラッグバーの地色も背景設定に連動(タイトル・ボタンは不透明のまま)
+        DragBar.Background = TintBrush("#1f1f1f", _overlayOpacity);
+        foreach (var g in new[] { _tl, _tr, _bl, _br })
+            g.Opacity = _panelOpacity;
+    }
+
+    /// <summary>透過設定の正規化(0.1〜1.0 の 10% 刻み。
+    /// 範囲外や 0(旧バージョンのオフ)は 1.0=不透明にする)。</summary>
+    private static double NormalizeOpacity(double? v) =>
+        v is >= 0.1 and <= 1.0 ? Math.Round(v.Value * 10) / 10 : 1.0;
+
+    /// <summary>オーバーレイの濃さ(0.1〜1.0)に応じた下地ブラシ。</summary>
+    private static System.Windows.Media.Brush TintBrush(string hex, double opacity)
+    {
+        var b = new SolidColorBrush(Sparkline.Hex(hex)) { Opacity = opacity };
+        b.Freeze();
+        return b;
+    }
+
+    /// <summary>枠なしモードのドラッグバーのイベントを接続する。
+    /// バーのドラッグで移動(DragMove は SC_MOVE ベースなので既存の
+    /// WM_ENTERSIZEMOVE 検出によるドラッグ中の描画停止がそのまま効く)、
+    /// ダブルクリックで最大化切替。右クリックはウィンドウ共通のメニューを開く。</summary>
+    private void SetupDragBar()
+    {
+        DragBar.MouseLeftButtonDown += (_, e) =>
+        {
+            if (e.ClickCount == 2)
+            {
+                WindowState = WindowState == System.Windows.WindowState.Maximized
+                    ? System.Windows.WindowState.Normal
+                    : System.Windows.WindowState.Maximized;
+                return;
+            }
+            DragMove();
+        };
+        DragBar.MouseRightButtonUp += (_, e) =>
+        {
+            // ContextMenu インスタンスの共有を避けるため明示的に開く
+            if (Root.ContextMenu is { } menu)
+            {
+                menu.PlacementTarget = DragBar;
+                menu.IsOpen = true;
+            }
+            e.Handled = true;
+        };
+        SetupDragBarButton(DragBarMinimize, "#3a3a3a",
+            () => WindowState = System.Windows.WindowState.Minimized); // StateChanged でトレイ退避
+        SetupDragBarButton(DragBarClose, "#c42b1c", Close); // Closing でトレイ退避
+    }
+
+    /// <summary>ドラッグバーのボタン(最小化/閉じる)にホバー色とクリック処理を付ける。
+    /// MouseLeftButtonDown を Handled にしてバーの DragMove を発火させない。</summary>
+    private static void SetupDragBarButton(TextBlock button, string hoverColor, Action action)
+    {
+        button.MouseLeftButtonDown += (_, e) => e.Handled = true;
+        button.MouseLeftButtonUp += (_, _) => action();
+        button.MouseEnter += (_, _) => button.Background = MetricRow.FreezeBrush(hoverColor);
+        button.MouseLeave += (_, _) => button.Background = Brushes.Transparent;
     }
 
     /// <summary>表示要素の切替メニュー項目を作る。</summary>
@@ -766,14 +934,13 @@ public partial class MainWindow : Window
         return row;
     }
 
-    // ---- ドラッグ/リサイズ検出 ----
+    // ---- ドラッグ/リサイズ検出・ヒットテスト ----
 
     protected override void OnSourceInitialized(EventArgs e)
     {
         base.OnSourceInitialized(e);
         var source = (HwndSource?)PresentationSource.FromVisual(this);
         source?.AddHook(WndProc);
-        ApplyWindowFrameTheme();
     }
 
     private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
@@ -782,38 +949,221 @@ public partial class MainWindow : Window
             _dragging = true;
         else if (msg == WmExitSizeMove)
             _dragging = false;
-        else if (msg == WmSettingChange)
-            ApplyWindowFrameTheme(); // OS のテーマ変更に追従
+        else if (msg == WmNcHitTest)
+            return HitTest(hwnd, lParam, ref handled);
+        else if (msg == WmGetMinMaxInfo)
+            LimitMaxSize(hwnd, lParam, ref handled);
         return IntPtr.Zero;
     }
 
-    // ---- ウィンドウ枠のテーマ ----
+    /// <summary>WM_NCHITTEST の処理。常時枠なしウィンドウのため、縁(6px)は
+    /// リサイズ(HTLEFT 等)を自分で返す。ドラッグバーと表示エリアは通常処理。
+    /// (クリックスルーはここではなく WS_EX_TRANSPARENT の付け外しで実現する。
+    /// ULW ウィンドウでは HTTRANSPARENT が他プロセスのウィンドウに効かないため)</summary>
+    private IntPtr HitTest(IntPtr hwnd, IntPtr lParam, ref bool handled)
+    {
+        // lParam はスクリーン座標(符号付き 16bit x2。マルチモニタの負座標に対応)
+        long lp = lParam.ToInt64();
+        int sx = (short)(lp & 0xFFFF);
+        int sy = (short)((lp >> 16) & 0xFFFF);
+        if (!GetClientRect(hwnd, out Win32Rect rc))
+            return IntPtr.Zero;
+        var origin = new Win32Point();
+        if (!ClientToScreen(hwnd, ref origin))
+            return IntPtr.Zero;
+        int left = origin.X, top = origin.Y;
+        int right = origin.X + rc.Right, bottom = origin.Y + rc.Bottom;
+        if (sx < left || sx >= right || sy < top || sy >= bottom)
+            return IntPtr.Zero; // クライアント外は通常処理
+        double dpi = PresentationSource.FromVisual(this)?.CompositionTarget?.TransformToDevice.M11 ?? 1.0;
+        int border = Math.Max(1, (int)(6 * dpi));
+        // 縁はリサイズ(最大化中は無効)
+        if (WindowState != System.Windows.WindowState.Maximized)
+        {
+            bool l = sx - left < border, r = right - sx <= border;
+            bool t = sy - top < border, b = bottom - sy <= border;
+            if (l || r || t || b)
+            {
+                handled = true;
+                if (t && l) return new IntPtr(HtTopLeft);
+                if (t && r) return new IntPtr(HtTopRight);
+                if (b && l) return new IntPtr(HtBottomLeft);
+                if (b && r) return new IntPtr(HtBottomRight);
+                if (t) return new IntPtr(HtTop);
+                if (b) return new IntPtr(HtBottom);
+                return new IntPtr(l ? HtLeft : HtRight);
+            }
+        }
+        return IntPtr.Zero;
+    }
 
-    /// <summary>タイトルバーなどのウィンドウ枠を OS のアプリテーマ(ライト/ダーク)に
-    /// 合わせる。Personalize\AppsUseLightTheme を読み、DWM の
-    /// DWMWA_USE_IMMERSIVE_DARK_MODE に反映する。本体 UI は常にダークのまま。
-    /// 属性 20 は 20H1 以降、19 は 1903/1909 用(失敗した側は無視)。</summary>
-    private void ApplyWindowFrameTheme()
+    /// <summary>最大化時にタスクバーを避ける(枠なしウィンドウはそのままだと
+    /// 画面全体に広がるため作業領域に収める)。最小サイズもここで伝える
+    /// (このメッセージを自分で処理すると WPF の MinWidth/MinHeight が効かなくなるため)。</summary>
+    private void LimitMaxSize(IntPtr hwnd, IntPtr lParam, ref bool handled)
+    {
+        var monitor = MonitorFromWindow(hwnd, MonitorDefaultToNearest);
+        var mi = new MonitorInfo { CbSize = Marshal.SizeOf<MonitorInfo>() };
+        if (!GetMonitorInfo(monitor, ref mi))
+            return;
+        var mmi = Marshal.PtrToStructure<MinMaxInfo>(lParam);
+        double dpi = PresentationSource.FromVisual(this)?.CompositionTarget?.TransformToDevice.M11 ?? 1.0;
+        mmi.MaxPosition = new Win32Point { X = mi.Work.Left - mi.Monitor.Left, Y = mi.Work.Top - mi.Monitor.Top };
+        mmi.MaxSize = new Win32Point { X = mi.Work.Right - mi.Work.Left, Y = mi.Work.Bottom - mi.Work.Top };
+        mmi.MinTrackSize = new Win32Point { X = (int)(MinWidth * dpi), Y = (int)(MinHeight * dpi) };
+        Marshal.StructureToPtr(mmi, lParam, false);
+        handled = true;
+    }
+
+    // ---- クリックスルー(WS_EX_TRANSPARENT の領域別付け外し)----
+
+    private IntPtr _mouseHook;
+    private bool _styleClickThrough; // hwnd に現在 WS_EX_TRANSPARENT が付いているか
+    private LowLevelMouseProc? _mouseHookProc; // GC 回収防止のため保持
+
+    /// <summary>クリックスルーを適用する。有効時は WH_MOUSE_LL フックを仕掛け、
+    /// カーソル位置に応じて WS_EX_TRANSPARENT を付け外しする:
+    /// 表示エリアでは付けて背面のウィンドウに操作を通し、ドラッグバーと
+    /// リサイズ縁では外して操作可能にする。
+    /// (ULW=AllowsTransparency ウィンドウは HTTRANSPARENT が他プロセスに
+    /// 効かないため、WM_NCHITTEST 方式ではなくこの方式を取る)</summary>
+    private void ApplyClickThrough()
     {
         var hwnd = new WindowInteropHelper(this).Handle;
         if (hwnd == IntPtr.Zero)
-            return;
-        bool dark;
-        try
+            return; // hwnd 未作成。Loaded で再適用される
+        if (_clickThrough)
         {
-            dark = Microsoft.Win32.Registry.GetValue(
-                @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
-                "AppsUseLightTheme", 1) is int v && v == 0;
+            var pt = new Win32Point();
+            GetCursorPos(ref pt);
+            SetStyleClickThrough(hwnd, !IsInteractivePoint(hwnd, pt.X, pt.Y));
+            if (_mouseHook == IntPtr.Zero)
+            {
+                _mouseHookProc = MouseHookProc;
+                _mouseHook = SetWindowsHookEx(WhMouseLL, _mouseHookProc, GetModuleHandle(null), 0);
+            }
         }
-        catch
+        else
         {
-            dark = true; // 読めなければ本体 UI に合わせてダーク
+            if (_mouseHook != IntPtr.Zero)
+            {
+                UnhookWindowsHookEx(_mouseHook);
+                _mouseHook = IntPtr.Zero;
+            }
+            SetStyleClickThrough(hwnd, false);
         }
-        int useDark = dark ? 1 : 0;
-        _ = DwmSetWindowAttribute(hwnd, 20, ref useDark, sizeof(int)) == 0 ||
-            DwmSetWindowAttribute(hwnd, 19, ref useDark, sizeof(int)) == 0;
     }
 
-    [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
-    private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
+    /// <summary>カーソルが操作可能ゾーン(ドラッグバー or リサイズ縁)にあるか。
+    /// false なら表示エリアかウィンドウ外(= 背面に通す側)。</summary>
+    private bool IsInteractivePoint(IntPtr hwnd, int sx, int sy)
+    {
+        if (!GetClientRect(hwnd, out Win32Rect rc))
+            return false;
+        var origin = new Win32Point();
+        if (!ClientToScreen(hwnd, ref origin))
+            return false;
+        int left = origin.X, top = origin.Y;
+        int right = origin.X + rc.Right, bottom = origin.Y + rc.Bottom;
+        if (sx < left || sx >= right || sy < top || sy >= bottom)
+            return false; // ウィンドウ外
+        double dpi = PresentationSource.FromVisual(this)?.CompositionTarget?.TransformToDevice.M11 ?? 1.0;
+        int border = Math.Max(1, (int)(6 * dpi));
+        if (sx - left < border || right - sx <= border || sy - top < border || bottom - sy <= border)
+            return true; // リサイズ縁
+        return sy - top < (int)(DragBar.ActualHeight * dpi); // ドラッグバー
+    }
+
+    /// <summary>WS_EX_TRANSPARENT の付け外し(変化があるときだけ API を呼ぶ)。</summary>
+    private void SetStyleClickThrough(IntPtr hwnd, bool on)
+    {
+        if (_styleClickThrough == on)
+            return;
+        _styleClickThrough = on;
+        long style = GetWindowLongPtr(hwnd, GwlpExStyle).ToInt64();
+        SetWindowLongPtr(hwnd, GwlpExStyle,
+            new IntPtr(on ? style | WsExTransparent : style & ~WsExTransparent));
+    }
+
+    private IntPtr MouseHookProc(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0 && wParam.ToInt64() == WmMouseMove)
+        {
+            // MSLLHOOKSTRUCT の先頭は pt(スクリーン座標)
+            var pt = Marshal.PtrToStructure<Win32Point>(lParam);
+            var hwnd = new WindowInteropHelper(this).Handle;
+            if (hwnd != IntPtr.Zero)
+                SetStyleClickThrough(hwnd, !IsInteractivePoint(hwnd, pt.X, pt.Y));
+        }
+        return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
+    }
+
+    // ---- クリックスルー・リサイズ・最大化用の Win32 ----
+
+    private const int WmNcHitTest = 0x0084;
+    private const int WmGetMinMaxInfo = 0x0024;
+    private const int WmMouseMove = 0x0200;
+    private const int WhMouseLL = 14;
+    private const int GwlpExStyle = -20;
+    private const long WsExTransparent = 0x20;
+    private const int HtLeft = 10;
+    private const int HtRight = 11;
+    private const int HtTop = 12;
+    private const int HtTopLeft = 13;
+    private const int HtTopRight = 14;
+    private const int HtBottom = 15;
+    private const int HtBottomLeft = 16;
+    private const int HtBottomRight = 17;
+    private const int MonitorDefaultToNearest = 2;
+
+    private delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct Win32Point { public int X; public int Y; }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct Win32Rect { public int Left; public int Top; public int Right; public int Bottom; }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct MonitorInfo
+    {
+        public int CbSize;
+        public Win32Rect Monitor;
+        public Win32Rect Work;
+        public int Flags;
+    }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct MinMaxInfo
+    {
+        public Win32Point Reserved;
+        public Win32Point MaxSize;
+        public Win32Point MaxPosition;
+        public Win32Point MinTrackSize;
+        public Win32Point MaxTrackSize;
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool GetClientRect(IntPtr hWnd, out Win32Rect lpRect);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool ClientToScreen(IntPtr hWnd, ref Win32Point lpPoint);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromWindow(IntPtr hwnd, int flags);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MonitorInfo lpmi);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern IntPtr SetWindowLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool GetCursorPos(ref Win32Point lpPoint);
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelMouseProc lpfn,
+        IntPtr hMod, int dwThreadId);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern IntPtr GetModuleHandle(string? lpModuleName);
 }

@@ -27,6 +27,12 @@ public sealed class WindowState
     [JsonPropertyName("showDisks")] public bool ShowDisks { get; set; } = true;
     /// <summary>表示要素: AI Usage(Claude/Kimi)を表示するか。</summary>
     [JsonPropertyName("showUsage")] public bool ShowUsage { get; set; } = true;
+    /// <summary>半透明オーバーレイの不透明度(0.1〜1.0。1.0=不透明)。</summary>
+    [JsonPropertyName("overlayOpacity")] public double OverlayOpacity { get; set; } = 1.0;
+    /// <summary>クリックスルー(マウス操作を背面のウィンドウに通す)を有効にするか。</summary>
+    [JsonPropertyName("clickThrough")] public bool ClickThrough { get; set; }
+    /// <summary>パネル背景の不透明度(0.1〜1.0。1.0=不透明)。</summary>
+    [JsonPropertyName("panelOpacity")] public double PanelOpacity { get; set; } = 1.0;
 
     private static string StatePath =>
         Path.Combine(AppContext.BaseDirectory, "window-state.json");
