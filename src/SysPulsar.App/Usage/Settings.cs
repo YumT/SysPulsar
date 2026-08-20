@@ -21,10 +21,13 @@ public sealed class Settings
     public bool NotifyOnThreshold { get; set; } = true;
     public bool EnableClaude { get; set; } = true;
     public bool EnableKimi { get; set; } = true;
+    public bool EnableOpenCodeGo { get; set; } = true;
     /// <summary>AI Usage エリアに Claude のゲージを表示するか(右クリックメニューで切替)。</summary>
     public bool ShowClaude { get; set; } = true;
     /// <summary>AI Usage エリアに Kimi のゲージを表示するか(右クリックメニューで切替)。</summary>
     public bool ShowKimi { get; set; } = true;
+    /// <summary>AI Usage エリアに OpenCode Go のゲージを表示するか(右クリックメニューで切替)。</summary>
+    public bool ShowOpenCodeGo { get; set; } = true;
 
     public static Settings Load()
     {
@@ -42,8 +45,10 @@ public sealed class Settings
             s.NotifyOnThreshold = GetBool(r, "notifyOnThreshold", s.NotifyOnThreshold);
             s.EnableClaude = GetBool(r, "enableClaude", s.EnableClaude);
             s.EnableKimi = GetBool(r, "enableKimi", s.EnableKimi);
+            s.EnableOpenCodeGo = GetBool(r, "enableOpenCodeGo", s.EnableOpenCodeGo);
             s.ShowClaude = GetBool(r, "showClaude", GetBool(r, "showAiUsage", s.ShowClaude));
             s.ShowKimi = GetBool(r, "showKimi", GetBool(r, "showAiUsage", s.ShowKimi));
+            s.ShowOpenCodeGo = GetBool(r, "showOpenCodeGo", GetBool(r, "showAiUsage", s.ShowOpenCodeGo));
             if (r.TryGetProperty("x", out var x) && x.ValueKind == JsonValueKind.Number) s.X = x.GetInt32();
             if (r.TryGetProperty("y", out var y) && y.ValueKind == JsonValueKind.Number) s.Y = y.GetInt32();
         }
@@ -69,8 +74,10 @@ public sealed class Settings
                 ["notifyOnThreshold"] = NotifyOnThreshold,
                 ["enableClaude"] = EnableClaude,
                 ["enableKimi"] = EnableKimi,
+                ["enableOpenCodeGo"] = EnableOpenCodeGo,
                 ["showClaude"] = ShowClaude,
                 ["showKimi"] = ShowKimi,
+                ["showOpenCodeGo"] = ShowOpenCodeGo,
                 ["x"] = X,
                 ["y"] = Y,
             }, new JsonSerializerOptions { WriteIndented = true });

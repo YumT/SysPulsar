@@ -280,7 +280,7 @@ public partial class MainWindow : Window
         elementMenu.Items.Add(MakeElementToggle("CPU など (メトリクス)", _showMetrics, v => _showMetrics = v));
         elementMenu.Items.Add(MakeElementToggle("プロセス＆イベント", _showProcesses, v => _showProcesses = v));
         elementMenu.Items.Add(MakeElementToggle("ドライブ (ディスク)", _showDisks, v => _showDisks = v));
-        elementMenu.Items.Add(MakeElementToggle("AI Usage (Claude/Kimi)", _showUsage, v => _showUsage = v));
+        elementMenu.Items.Add(MakeElementToggle("AI Usage (Claude/Kimi/OpenCode Go)", _showUsage, v => _showUsage = v));
         Root.ContextMenu.Items.Add(elementMenu);
 
         // 常に手前に表示(状態は window-state.json に保存し次回起動時に復元)
@@ -318,11 +318,12 @@ public partial class MainWindow : Window
         _trayClickThrough.Checked = _clickThrough; // トレイ側にも初期状態を反映
         Root.ContextMenu.Items.Add(new Separator());
 
-        // AI Usage の Claude / Kimi 個別の表示切替(デフォルト両方表示。
+        // AI Usage の Claude / Kimi / OpenCode Go 個別の表示切替(デフォルト表示。
         // 状態は settings.json に保存し次回起動時に復元。
-        // 両方非表示なら AI Usage 要素は出ず、そのぶん他の要素が詰めて表示される)
+        // 全て非表示なら AI Usage 要素は出ず、そのぶん他の要素が詰めて表示される)
         Root.ContextMenu.Items.Add(MakeUsageToggle("Claude", "claude", _usageSettings.ShowClaude, v => _usageSettings.ShowClaude = v));
         Root.ContextMenu.Items.Add(MakeUsageToggle("Kimi", "kimi", _usageSettings.ShowKimi, v => _usageSettings.ShowKimi = v));
+        Root.ContextMenu.Items.Add(MakeUsageToggle("OpenCode Go", "opencode-go", _usageSettings.ShowOpenCodeGo, v => _usageSettings.ShowOpenCodeGo = v));
         Root.ContextMenu.Items.Add(new Separator());
 
         // 手動の更新確認(起動時の自動チェックと同じ流れ。更新があれば DL まで済ませて
@@ -519,6 +520,7 @@ public partial class MainWindow : Window
     {
         _usagePanel.SetProviderVisible("claude", _usageSettings.ShowClaude);
         _usagePanel.SetProviderVisible("kimi", _usageSettings.ShowKimi);
+        _usagePanel.SetProviderVisible("opencode-go", _usageSettings.ShowOpenCodeGo);
 
         bool hasBottom = _layoutMode is 21 or 22;
         bool hasRight = _layoutMode is 12 or 22;
@@ -535,8 +537,9 @@ public partial class MainWindow : Window
             _ => [(0, 0), (0, 1), (1, 0), (1, 1)],
         };
 
-        // 有効な表示要素(固定順)。AI Usage は Claude/Kimi 両方非表示なら要素自体なし
-        bool usageVisible = _showUsage && (_usageSettings.ShowClaude || _usageSettings.ShowKimi);
+        // 有効な表示要素(固定順)。AI Usage は全プロバイダ非表示なら要素自体なし
+        bool usageVisible = _showUsage &&
+            (_usageSettings.ShowClaude || _usageSettings.ShowKimi || _usageSettings.ShowOpenCodeGo);
         var elements = new List<Grid>(4);
         if (_showMetrics) elements.Add(_tl);
         if (_showProcesses) elements.Add(_tr);
@@ -615,6 +618,7 @@ public partial class MainWindow : Window
         var providers = new List<IUsageProvider>();
         if (_usageSettings.EnableClaude) providers.Add(new ClaudeProvider());
         if (_usageSettings.EnableKimi) providers.Add(new KimiProvider(_config.KimiApiKey));
+        if (_usageSettings.EnableOpenCodeGo) providers.Add(new OpenCodeGoProvider(_config.OpenCodeApiKey));
         foreach (var p in providers) _usagePanel.RegisterProvider(p.Id);
         _usagePoller = new UsagePoller(providers, _usageSettings);
         _usagePoller.SnapshotUpdated += snap =>

@@ -16,6 +16,9 @@ public sealed class AppConfig
     [JsonPropertyName("disks")] public List<DiskEntry> Disks { get; set; } = new();
     /// <summary>Kimi Code Console で発行する API キー(sk-...)。AI Usage の Kimi 側認証で最優先。</summary>
     [JsonPropertyName("kimiApiKey")] public string KimiApiKey { get; set; } = "";
+    /// <summary>OpenCode Go の API キー。AI Usage の OpenCode Go 認証で最優先。
+    /// 未設定なら OPENCODE_API_KEY 環境変数 / opencode.json / auth.json を参照する。</summary>
+    [JsonPropertyName("opencodeApiKey")] public string OpenCodeApiKey { get; set; } = "";
 
     public sealed class DiskEntry
     {

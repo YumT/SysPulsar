@@ -4,6 +4,7 @@ using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 
 namespace SysPulsar.App.Usage;
 
@@ -487,5 +488,188 @@ public sealed class KimiProvider : IUsageProvider
         }
         var last = Flush();
         return last.Item1 != null ? last : (fallbackKey, fallbackUrl);
+    }
+}
+
+/// <summary>
+/// OpenCode Go のクォータ(残り利用枠)。
+/// GET https://opencode.ai/zen/go/v1/usage
+/// 認証: API キー(Bearer)。優先順:
+///   1. 環境変数 OPENCODE_API_KEY
+///   2. opencode.json / opencode.jsonc(グローバル ~/.config/opencode) の
+///      provider.opencode.options.apiKey
+///   3. auth.json(~/.local/share/opencode / %APPDATA%\opencode / %LOCALAPPDATA%\opencode) の
+///      opencode-go または opencode エントリ { "type": "api", "key": "..." }
+/// レスポンス: usage { rolling / weekly / monthly } の各 { status, percent(使用%), resetsAt(ISO+offset) }。
+/// SysPulsar のゲージは「使用量%」表示のため、percent(使用%)をそのまま表示する。
+/// ※ 非公式API。参考: https://github.com/slkiser/opencode-quota
+/// </summary>
+public sealed class OpenCodeGoProvider : IUsageProvider
+{
+    public string Id => "opencode-go";
+    public string DisplayName => "OpenCode Go";
+
+    const string UsageUrl = "https://opencode.ai/zen/go/v1/usage";
+
+    readonly string? _configApiKey;
+
+    /// <summary>configApiKey: SysPulsar の config.json の opencodeApiKey(あれば最優先)。</summary>
+    public OpenCodeGoProvider(string? configApiKey = null)
+    {
+        _configApiKey = string.IsNullOrWhiteSpace(configApiKey) ? null : configApiKey.Trim();
+    }
+
+    static readonly string[] AuthJsonCandidates =
+    [
+        // xdg-basedir → ~/.local/share/opencode
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".local", "share", "opencode", "auth.json"),
+        // Windows 互換のフォールバック
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "opencode", "auth.json"),
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "opencode", "auth.json"),
+    ];
+
+    static readonly string[] ConfigCandidates =
+    [
+        // グローバル設定(ローカル/カレントは信頼しない)。jsonc を優先
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".config", "opencode", "opencode.jsonc"),
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".config", "opencode", "opencode.json"),
+    ];
+
+    public async Task<UsageSnapshot> FetchAsync(HttpClient http, CancellationToken ct)
+    {
+        var snap = new UsageSnapshot { ProviderId = Id, DisplayName = DisplayName };
+
+        // config.json の opencodeApiKey が最優先。なければ環境変数/opencode.json/auth.json を参照
+        string? apiKey = _configApiKey;
+        string source = "config.json";
+        if (apiKey == null)
+            apiKey = ResolveApiKey(out source);
+
+        if (string.IsNullOrEmpty(apiKey))
+        {
+            snap.AuthMessage = "OpenCode Go の API キーが見つかりません"
+                + "（config.json の opencodeApiKey、OPENCODE_API_KEY、opencode.json の"
+                + " provider.opencode.options.apiKey、または auth.json を設定してください）";
+            return snap;
+        }
+
+        using var req = new HttpRequestMessage(HttpMethod.Get, UsageUrl);
+        req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+        req.Headers.Accept.Add(new System.Net.Http.Headers.MediaTypeWithQualityHeaderValue("application/json"));
+        req.Headers.TryAddWithoutValidation("User-Agent", "usage-watcher/1.0");
+
+        using var res = await http.SendAsync(req, ct);
+        if (res.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+        {
+            snap.AuthMessage = "OpenCode Go の API キーが無効です（" + source + "）";
+            return snap;
+        }
+        if (res.StatusCode == (HttpStatusCode)429)
+            throw ClaudeProvider.RateLimited(res);
+
+        var body = await res.Content.ReadAsStringAsync(ct);
+        Log.DumpDebugJson(Id, body);
+        res.EnsureSuccessStatusCode();
+
+        using var json = JsonDocument.Parse(body);
+        if (!json.RootElement.TryGetProperty("usage", out var usage) ||
+            usage.ValueKind != JsonValueKind.Object)
+        {
+            snap.Error = "OpenCode Go API レスポンスに usage がありません";
+            return snap;
+        }
+
+        // rolling / weekly / monthly の順に表示
+        var order = new[] { ("rolling", "5h"), ("weekly", "Weekly"), ("monthly", "Monthly") };
+        foreach (var (key, label) in order)
+        {
+            if (!usage.TryGetProperty(key, out var w) || w.ValueKind != JsonValueKind.Object) continue;
+            if (!w.TryGetProperty("status", out var st) || st.GetString() != "ok") continue;
+            var percent = w.TryGetProperty("percent", out var p) && p.ValueKind == JsonValueKind.Number
+                ? p.GetDouble() : double.NaN;
+            if (double.IsNaN(percent)) continue;
+
+            DateTimeOffset? reset = null;
+            if (w.TryGetProperty("resetsAt", out var r) &&
+                r.ValueKind == JsonValueKind.String &&
+                DateTimeOffset.TryParse(r.GetString(), CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal, out var dto))
+                reset = dto;
+
+            // SysPulsar のゲージは「使用量%」表示設計のため、percent をそのまま渡す
+            // (残量の意味で使う UI ではない。0% 使用なら 0% 表示が正しい)
+            snap.Gauges.Add(new GaugeInfo
+            {
+                Label = label,
+                Percent = Math.Clamp(percent, 0, 100),
+                ResetAtUtc = reset,
+            });
+        }
+
+        if (snap.Gauges.Count == 0)
+            snap.Error = "OpenCode Go の利用枠データを取得できませんでした";
+        return snap;
+    }
+
+    /// <summary>API キーを解決する。見つからなければ null。source に由来を入れる。</summary>
+    internal static string? ResolveApiKey(out string source)
+    {
+        // 1. 環境変数
+        var env = Environment.GetEnvironmentVariable("OPENCODE_API_KEY")?.Trim();
+        if (!string.IsNullOrEmpty(env))
+        {
+            source = "OPENCODE_API_KEY";
+            return env;
+        }
+
+        // 2. opencode.json / opencode.jsonc(グローバル) の provider.opencode.options.apiKey
+        foreach (var path in ConfigCandidates)
+        {
+            if (!File.Exists(path)) continue;
+            try
+            {
+                var config = JsonNode.Parse(File.ReadAllText(path)) as JsonObject;
+                var key = config?["provider"]?["opencode"]?["options"]?["apiKey"]?.GetValue<string>();
+                if (!string.IsNullOrWhiteSpace(key))
+                {
+                    source = Path.GetFileName(path);
+                    return key!.Trim();
+                }
+            }
+            catch
+            {
+                // 壊れていても次へ
+            }
+        }
+
+        // 3. auth.json(複数候補)の opencode-go / opencode エントリ
+        foreach (var path in AuthJsonCandidates)
+        {
+            if (!File.Exists(path)) continue;
+            try
+            {
+                var auth = JsonNode.Parse(File.ReadAllText(path)) as JsonObject;
+                var entry = auth?["opencode-go"] ?? auth?["opencode"];
+                var type = entry?["type"]?.GetValue<string>();
+                var key = entry?["key"]?.GetValue<string>();
+                if (type == "api" && !string.IsNullOrWhiteSpace(key))
+                {
+                    source = "auth.json(" + path + ")";
+                    return key!.Trim();
+                }
+            }
+            catch
+            {
+                // 次へ
+            }
+        }
+
+        source = "";
+        return null;
     }
 }
