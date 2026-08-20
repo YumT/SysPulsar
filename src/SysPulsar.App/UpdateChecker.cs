@@ -104,8 +104,11 @@ public static class UpdateChecker
                 return Failed;
             return new CheckResult(new UpdateInfo(latest, stage), false);
         }
-        catch
+        catch (Exception ex)
         {
+            // 手動の「更新を確認」で「ネットワークを確認してください」と出た場合に
+            // 原因を特定できるよう、失敗内容をログに残す(本体・表示は従来どおり)。
+            SysPulsar.App.Usage.Log.Error("更新確認の失敗: " + ex.GetType().Name + ": " + ex.Message);
             return Failed;
         }
     }
