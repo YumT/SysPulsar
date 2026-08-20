@@ -673,3 +673,147 @@ public sealed class OpenCodeGoProvider : IUsageProvider
         return null;
     }
 }
+
+/// <summary>
+/// Cline (VS Code 拡張) の使用量(ローカル履歴の集計)。
+/// Cline は「残量」を外部 API から取得せず、各タスクの
+/// api_conversation_history.json にメッセージ毎のトークン数・推定コストを記録する。
+/// ここでは ~/AppData/Roaming/Code/User/globalStorage/saoudrizwan.claude-dev/tasks/*/
+/// 配下の履歴を読み、期間(今月/今週/合計)ごとのトークン使用量と推定コストを集計して表示する。
+/// ※ API 呼び出しは不要。ローカルファイルの読み取りのみ(認証トークンは扱わない)。
+/// </summary>
+public sealed class ClineProvider : IUsageProvider
+{
+    public string Id => "cline";
+    public string DisplayName => "Cline";
+
+    static readonly string TasksDir =
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "tasks");
+
+    public async Task<UsageSnapshot> FetchAsync(HttpClient http, CancellationToken ct)
+    {
+        var snap = new UsageSnapshot { ProviderId = Id, DisplayName = DisplayName };
+
+        if (!Directory.Exists(TasksDir))
+        {
+            snap.AuthMessage = "Cline (VS Code 拡張) の履歴が見つかりません";
+            return snap;
+        }
+
+        // 全タスクの api_conversation_history.json を走査し、metrics.tokens / metrics.cost を集計
+        long tokenPrompt = 0, tokenCompletion = 0, tokenCached = 0;
+        double cost = 0;
+        int fileCount = 0;
+        var now = DateTimeOffset.Now;
+        // 期間: 今月 / 今週 / 合計
+        long monthPrompt = 0, monthCompletion = 0;
+        double monthCost = 0;
+        long weekPrompt = 0, weekCompletion = 0;
+        double weekCost = 0;
+        var weekStart = now.AddDays(-(int)now.DayOfWeek); // 週の開始(日曜)
+        var monthStart = new DateTimeOffset(now.Year, now.Month, 1, 0, 0, 0, now.Offset);
+
+        try
+        {
+            foreach (var dir in Directory.EnumerateDirectories(TasksDir))
+            {
+                ct.ThrowIfCancellationRequested();
+                var path = Path.Combine(dir, "api_conversation_history.json");
+                if (!File.Exists(path)) continue;
+                try
+                {
+                    using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                    using var doc = await JsonDocument.ParseAsync(fs, cancellationToken: ct);
+                    if (doc.RootElement.ValueKind != JsonValueKind.Array) continue;
+                    foreach (var msg in doc.RootElement.EnumerateArray())
+                    {
+                        if (!msg.TryGetProperty("metrics", out var metrics) ||
+                            metrics.ValueKind != JsonValueKind.Object) continue;
+                        // メッセージのタイムスタンプ(期間判定用)
+                        var ts = msg.TryGetProperty("ts", out var t) && t.ValueKind == JsonValueKind.Number
+                            ? DateTimeOffset.FromUnixTimeMilliseconds(t.GetInt64()) : (DateTimeOffset?)null;
+
+                        long prompt = 0, completion = 0, cached = 0;
+                        if (metrics.TryGetProperty("tokens", out var tok) && tok.ValueKind == JsonValueKind.Object)
+                        {
+                            prompt = GetLong(tok, "prompt");
+                            completion = GetLong(tok, "completion");
+                            cached = GetLong(tok, "cached");
+                        }
+                        var msgCost = metrics.TryGetProperty("cost", out var c) && c.ValueKind == JsonValueKind.Number
+                            ? c.GetDouble() : 0;
+
+                        tokenPrompt += prompt;
+                        tokenCompletion += completion;
+                        tokenCached += cached;
+                        cost += msgCost;
+                        fileCount++;
+
+                        if (ts != null)
+                        {
+                            if (ts >= monthStart) { monthPrompt += prompt; monthCompletion += completion; monthCost += msgCost; }
+                            if (ts >= weekStart) { weekPrompt += prompt; weekCompletion += completion; weekCost += msgCost; }
+                        }
+                    }
+                }
+                catch
+                {
+                    // 1ファイルの失敗は無視して次へ
+                }
+            }
+        }
+        catch (OperationCanceledException) { throw; }
+
+        if (fileCount == 0)
+        {
+            snap.Error = "Cline の使用量データがありません";
+            return snap;
+        }
+
+        // ゲージ表示: トークン数と推定コストを「使用量」として数値表示(Percent は使用しない)
+        long totalTokens = tokenPrompt + tokenCompletion;
+        snap.Gauges.Add(new GaugeInfo
+        {
+            Label = "今月のトークン",
+            Percent = 0,
+            Text = FmtTokens(monthPrompt + monthCompletion),
+        });
+        snap.Gauges.Add(new GaugeInfo
+        {
+            Label = "今週のトークン",
+            Percent = 0,
+            Text = FmtTokens(weekPrompt + weekCompletion),
+        });
+        snap.Gauges.Add(new GaugeInfo
+        {
+            Label = "今月のコスト",
+            Percent = 0,
+            Text = $"${monthCost:F3}",
+        });
+        snap.Gauges.Add(new GaugeInfo
+        {
+            Label = "累計トークン",
+            Percent = 0,
+            Text = FmtTokens(totalTokens),
+        });
+        snap.Gauges.Add(new GaugeInfo
+        {
+            Label = "累計コスト",
+            Percent = 0,
+            Text = $"${cost:F3}",
+        });
+        return snap;
+    }
+
+    static long GetLong(JsonElement el, string name)
+    {
+        if (el.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number)
+            return v.GetInt64();
+        return 0;
+    }
+
+    static string FmtTokens(long n) =>
+        n >= 1_000_000 ? $"{n / 1_000_000.0:F1}M" :
+        n >= 1_000 ? $"{n / 1_000.0:F1}K" : $"{n}";
+}

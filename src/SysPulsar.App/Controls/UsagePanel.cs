@@ -115,7 +115,7 @@ public sealed class UsagePanel : Grid
 
         // ゲージ(本数は変わり得るので差分管理)
         foreach (var g in snap.Gauges)
-            sec.SetGauge(g.Label, g.Percent, g.ResetAtUtc, ColorFor(g.Percent));
+            sec.SetGauge(g.Label, g.Percent, g.Text, g.ResetAtUtc, ColorFor(g.Percent));
     }
 
     /// <summary>カウントダウン表示だけ更新する(定期呼び出し用)。</summary>
@@ -175,7 +175,7 @@ public sealed class UsagePanel : Grid
             _warn.Visibility = Visibility.Visible;
         }
 
-        public void SetGauge(string label, double pct, DateTimeOffset? resetUtc, Brush color)
+        public void SetGauge(string label, double pct, string? text, DateTimeOffset? resetUtc, Brush color)
         {
             if (!_rows.TryGetValue(label, out var row))
             {
@@ -183,7 +183,7 @@ public sealed class UsagePanel : Grid
                 _rows[label] = row;
                 _gauges.Children.Add(row);
             }
-            row.Set(pct, resetUtc, color);
+            row.Set(pct, text, resetUtc, color);
         }
 
         public void Tick()
@@ -264,10 +264,10 @@ public sealed class UsagePanel : Grid
             Children.Add(_resetLabel);
         }
 
-        public void Set(double pct, DateTimeOffset? resetUtc, Brush color)
+        public void Set(double pct, string? text, DateTimeOffset? resetUtc, Brush color)
         {
             _pct = Math.Clamp(pct, 0, 100);
-            _pctLabel.Text = $"{pct:0}%";
+            _pctLabel.Text = text ?? $"{pct:0}%";
             _pctLabel.Foreground = color;
             _fill.Background = color;
             _resetUtc = resetUtc;

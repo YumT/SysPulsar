@@ -6,6 +6,9 @@ public sealed class GaugeInfo
     public string Label { get; set; } = "";
     public double Percent { get; set; }
     public DateTimeOffset? ResetAtUtc { get; set; }
+
+    /// <summary>数値表示用のテキスト(例: "$1.23", "123K tokens")。設定すると Percent の代わりに表示する。</summary>
+    public string? Text { get; set; }
 }
 
 /// <summary>プロバイダ1社ぶんの取得結果スナップショット。</summary>

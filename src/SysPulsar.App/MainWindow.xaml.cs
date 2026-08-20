@@ -324,6 +324,7 @@ public partial class MainWindow : Window
         Root.ContextMenu.Items.Add(MakeUsageToggle("Claude", "claude", _usageSettings.ShowClaude, v => _usageSettings.ShowClaude = v));
         Root.ContextMenu.Items.Add(MakeUsageToggle("Kimi", "kimi", _usageSettings.ShowKimi, v => _usageSettings.ShowKimi = v));
         Root.ContextMenu.Items.Add(MakeUsageToggle("OpenCode Go", "opencode-go", _usageSettings.ShowOpenCodeGo, v => _usageSettings.ShowOpenCodeGo = v));
+        Root.ContextMenu.Items.Add(MakeUsageToggle("Cline", "cline", _usageSettings.ShowCline, v => _usageSettings.ShowCline = v));
         Root.ContextMenu.Items.Add(new Separator());
 
         // 手動の更新確認(起動時の自動チェックと同じ流れ。更新があれば DL まで済ませて
@@ -521,6 +522,7 @@ public partial class MainWindow : Window
         _usagePanel.SetProviderVisible("claude", _usageSettings.ShowClaude);
         _usagePanel.SetProviderVisible("kimi", _usageSettings.ShowKimi);
         _usagePanel.SetProviderVisible("opencode-go", _usageSettings.ShowOpenCodeGo);
+        _usagePanel.SetProviderVisible("cline", _usageSettings.ShowCline);
 
         bool hasBottom = _layoutMode is 21 or 22;
         bool hasRight = _layoutMode is 12 or 22;
@@ -539,7 +541,7 @@ public partial class MainWindow : Window
 
         // 有効な表示要素(固定順)。AI Usage は全プロバイダ非表示なら要素自体なし
         bool usageVisible = _showUsage &&
-            (_usageSettings.ShowClaude || _usageSettings.ShowKimi || _usageSettings.ShowOpenCodeGo);
+            (_usageSettings.ShowClaude || _usageSettings.ShowKimi || _usageSettings.ShowOpenCodeGo || _usageSettings.ShowCline);
         var elements = new List<Grid>(4);
         if (_showMetrics) elements.Add(_tl);
         if (_showProcesses) elements.Add(_tr);
@@ -619,6 +621,7 @@ public partial class MainWindow : Window
         if (_usageSettings.EnableClaude) providers.Add(new ClaudeProvider());
         if (_usageSettings.EnableKimi) providers.Add(new KimiProvider(_config.KimiApiKey));
         if (_usageSettings.EnableOpenCodeGo) providers.Add(new OpenCodeGoProvider(_config.OpenCodeApiKey));
+        if (_usageSettings.EnableCline) providers.Add(new ClineProvider());
         foreach (var p in providers) _usagePanel.RegisterProvider(p.Id);
         _usagePoller = new UsagePoller(providers, _usageSettings);
         _usagePoller.SnapshotUpdated += snap =>
