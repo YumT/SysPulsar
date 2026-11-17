@@ -80,9 +80,18 @@
     { "number": 3, "label": "システム" },
     { "number": 4, "label": "ゲーム" }
   ],
-  "kimiApiKey": ""
+  "kimiApiKey": "",
+  "openaiAdminKey": "",
+  "openaiCreditBalance": 25.00,
+  "openaiCreditAsOf": "2026-11-17 10:30"
 }
 ```
+
+- `openaiAdminKey` / `openaiCreditBalance` / `openaiCreditAsOf`: AI Usage の
+  OpenAI 残クレジット用(後述)。`openaiAdminKey` は組織の Admin API キー(sk-admin-...)、
+  `openaiCreditBalance` は Billing ページで見た残高(USD)、`openaiCreditAsOf` は
+  その残高を見た日時(オフセット無しはローカル時刻)。クレジットを買い足したら
+  残高と日時を書き換える。キーの実値は `kimiApiKey` と同じく git 管理外に置く
 
 - `kimiApiKey`: Kimi Code Console で発行する API キー(sk-...)。
   AI Usage の Kimi 側認証で最優先に使われる(後述)。**git 管理外の実値は
@@ -120,6 +129,7 @@
     `scope.model.display_name` が Fable の行があるときだけ表示。
     他のモデル別枠は出さない。応答から枠が消えたら行も消える)
   - Kimi: 5-hour usage / 7-day usage / Total usage(取れるものだけ表示)
+  - OpenAI: 残クレジット(数値は残額、バーは基準時点の残高に対する消費率)
 - **色分け**: 50% 未満=緑、50% 以上=橙、80% 以上=赤(しきい値は設定で変更可)
 - **ポーリング**: 120 秒周期(下限 30 秒)をプロバイダ毎にバックグラウンドで実行。
   HTTP 429 は Retry-After(最低 300 秒)でバックオフ。
@@ -143,6 +153,13 @@
     そのため 1 または 3 が主認証のときも、config.toml に旧キー(Kimi Work 時代、
     scope: FEATURE_WORK)が残っていれば agent-gw を併せて叩き Total usage を補完する。
     旧キー失効時は Total usage だけ自動的に非表示になる
+  - OpenAI: 残高を返す公式 API が無いため、公式の Costs API
+    (`api.openai.com/v1/organization/costs`。組織の Admin API キーが必要で、
+    プロジェクトキー sk-proj-... は不可)で `openaiCreditAsOf` 以降の利用額を合計し、
+    `openaiCreditBalance` から引いて残クレジットとする。Admin キーは
+    `config.json` の `openaiAdminKey` → 環境変数 `OPENAI_ADMIN_KEY` の順で探す。
+    Costs は日単位のバケットで反映が数時間遅れるため、基準日の当日分は
+    多めに引かれることがある(残高を少なめに見せる安全側)
 - **設定共有**: `%LOCALAPPDATA%\UsageWatcher\settings.json` を単体版 Watcher と共有
   (しきい値・ポーリング間隔・プロバイダ有効/無効・Claude/Kimi の表示切替)。
   ログも同じフォルダに出る

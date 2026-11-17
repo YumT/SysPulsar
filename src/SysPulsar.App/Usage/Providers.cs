@@ -717,6 +717,176 @@ public sealed class OpenCodeGoProvider : IUsageProvider
 }
 
 /// <summary>
+/// OpenAI API(プリペイドクレジット)の残クレジット。
+/// 残高を返す公式 API は無い(2026-11 時点。非公開の dashboard/billing/credit_grants は
+/// プロジェクトキーでは 403 になり、CodexBar も既定では使っていない)。そこで公式の
+/// Costs API で「基準時点からの利用額」を取り、config.json に書いた基準時点の残高から引く:
+///   残クレジット = openaiCreditBalance − (openaiCreditAsOf 以降の Costs 合計)
+/// GET https://api.openai.com/v1/organization/costs?start_time={基準時点}&amp;bucket_width=1d&amp;limit=180
+/// 認証: 組織の Admin API キー(sk-admin-...)。優先順: config.json の openaiAdminKey → 環境変数 OPENAI_ADMIN_KEY
+/// レスポンス: data[].results[].amount.value(USD)。has_more / next_page でページング(page=next_page)。
+/// クレジットを買い足したら、Billing ページの残高とその日時で openaiCreditBalance /
+/// openaiCreditAsOf を書き換える。
+/// ※ Costs は日単位のバケットで、反映が数時間遅れる。基準日の当日分は多めに引かれる
+///   ことがある(残高を少なめに見せる安全側)。
+/// </summary>
+public sealed class OpenAIProvider : IUsageProvider
+{
+    public string Id => "openai";
+    public string DisplayName => "OpenAI";
+
+    const string CostsUrl = "https://api.openai.com/v1/organization/costs";
+
+    /// <summary>ページングの上限(limit=180 日/ページなので 20 ページで約 10 年分)。</summary>
+    const int MaxPages = 20;
+
+    readonly string? _configAdminKey;
+    readonly double? _creditBalance;
+    readonly string? _creditAsOf;
+
+    /// <summary>config.json の openaiAdminKey / openaiCreditBalance / openaiCreditAsOf を渡す。</summary>
+    public OpenAIProvider(string? configAdminKey, double? creditBalance, string? creditAsOf)
+    {
+        _configAdminKey = string.IsNullOrWhiteSpace(configAdminKey) ? null : configAdminKey.Trim();
+        _creditBalance = creditBalance;
+        _creditAsOf = creditAsOf;
+    }
+
+    public async Task<UsageSnapshot> FetchAsync(HttpClient http, CancellationToken ct)
+    {
+        var snap = new UsageSnapshot { ProviderId = Id, DisplayName = DisplayName };
+
+        var adminKey = _configAdminKey;
+        var source = "config.json";
+        if (adminKey == null)
+        {
+            var env = Environment.GetEnvironmentVariable("OPENAI_ADMIN_KEY")?.Trim();
+            adminKey = string.IsNullOrEmpty(env) ? null : env;
+            source = "OPENAI_ADMIN_KEY";
+        }
+        if (adminKey == null)
+        {
+            snap.AuthMessage = "OpenAI の Admin API キーが見つかりません"
+                + "（config.json の openaiAdminKey に sk-admin-... を設定するか、"
+                + "環境変数 OPENAI_ADMIN_KEY を設定してください）";
+            return snap;
+        }
+        if (_creditBalance is not > 0 || !TryParseAsOf(_creditAsOf, out var asOf))
+        {
+            snap.AuthMessage = "config.json に openaiCreditBalance(Billing ページの残高 USD)と"
+                + " openaiCreditAsOf(その残高を見た日時。例: \"2026-11-17 10:30\")を設定してください";
+            return snap;
+        }
+        if (asOf > DateTimeOffset.Now)
+        {
+            snap.Error = "openaiCreditAsOf が未来の日時です: " + _creditAsOf;
+            return snap;
+        }
+
+        double spent = 0;
+        string? page = null;
+        var seen = new HashSet<string>();
+        for (var i = 0; ; i++)
+        {
+            var url = $"{CostsUrl}?start_time={asOf.ToUnixTimeSeconds()}&bucket_width=1d&limit=180"
+                + (page != null ? "&page=" + Uri.EscapeDataString(page) : "");
+            using var req = new HttpRequestMessage(HttpMethod.Get, url);
+            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", adminKey);
+            req.Headers.TryAddWithoutValidation("User-Agent", "usage-watcher/1.0");
+
+            using var res = await http.SendAsync(req, ct);
+            if (res.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+            {
+                snap.AuthMessage = "OpenAI の Admin API キーが無効か権限がありません（" + source
+                    + "。組織の Admin API キー sk-admin-... が必要で、プロジェクトキーは使えません）";
+                return snap;
+            }
+            if (res.StatusCode == (HttpStatusCode)429)
+                throw ClaudeProvider.RateLimited(res);
+
+            var body = await res.Content.ReadAsStringAsync(ct);
+            Log.DumpDebugJson(Id, body);
+            res.EnsureSuccessStatusCode();
+
+            using var json = JsonDocument.Parse(body);
+            spent += SumCosts(json.RootElement);
+            page = NextPage(json.RootElement);
+            if (page == null) break;
+            if (!seen.Add(page) || i + 1 >= MaxPages)
+                throw new InvalidOperationException("OpenAI Costs API のページングが終わりません");
+        }
+
+        snap.Gauges.Add(CreditGauge(_creditBalance.Value, spent));
+        return snap;
+    }
+
+    /// <summary>
+    /// 残クレジットのゲージ。テキストは残額、バーは基準時点の残高に対する消費率
+    /// (他のゲージと同じく「使用量%」。消費が進むほど橙→赤になる)。
+    /// </summary>
+    internal static GaugeInfo CreditGauge(double balance, double spent)
+    {
+        var remaining = balance - spent;
+        return new GaugeInfo
+        {
+            Label = "残クレジット",
+            Percent = Math.Clamp(spent / balance * 100.0, 0, 100),
+            Text = remaining < 0
+                ? "-$" + (-remaining).ToString("F2", CultureInfo.InvariantCulture)
+                : "$" + remaining.ToString("F2", CultureInfo.InvariantCulture),
+        };
+    }
+
+    /// <summary>Costs API の 1 ページぶんの data[].results[].amount.value を合計する(USD)。</summary>
+    internal static double SumCosts(JsonElement root)
+    {
+        if (!root.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Array)
+            throw new InvalidOperationException("OpenAI Costs API レスポンスに data がありません");
+
+        double sum = 0;
+        foreach (var bucket in data.EnumerateArray())
+        {
+            if (bucket.ValueKind != JsonValueKind.Object ||
+                !bucket.TryGetProperty("results", out var results) ||
+                results.ValueKind != JsonValueKind.Array) continue;
+            foreach (var r in results.EnumerateArray())
+            {
+                if (r.ValueKind != JsonValueKind.Object ||
+                    !r.TryGetProperty("amount", out var amount) ||
+                    amount.ValueKind != JsonValueKind.Object ||
+                    !amount.TryGetProperty("value", out var v)) continue;
+                if (v.ValueKind == JsonValueKind.Number)
+                    sum += v.GetDouble();
+                else if (v.ValueKind == JsonValueKind.String &&
+                    double.TryParse(v.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var d))
+                    sum += d;
+            }
+        }
+        return sum;
+    }
+
+    /// <summary>次ページのカーソル。最終ページなら null。</summary>
+    internal static string? NextPage(JsonElement root)
+    {
+        if (!root.TryGetProperty("has_more", out var hm) || hm.ValueKind != JsonValueKind.True)
+            return null;
+        if (root.TryGetProperty("next_page", out var np) && np.ValueKind == JsonValueKind.String &&
+            !string.IsNullOrWhiteSpace(np.GetString()))
+            return np.GetString()!.Trim();
+        throw new InvalidOperationException("OpenAI Costs API の next_page がありません");
+    }
+
+    /// <summary>openaiCreditAsOf を解釈する。タイムゾーン指定が無ければローカル時刻とみなす。</summary>
+    internal static bool TryParseAsOf(string? text, out DateTimeOffset asOf)
+    {
+        asOf = default;
+        return !string.IsNullOrWhiteSpace(text) &&
+            DateTimeOffset.TryParse(text.Trim(), CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeLocal, out asOf);
+    }
+}
+
+/// <summary>
 /// Cline (VS Code 拡張) の使用量(ローカル履歴の集計)。
 /// Cline は「残量」を外部 API から取得せず、各タスクの
 /// api_conversation_history.json にメッセージ毎のトークン数・推定コストを記録する。

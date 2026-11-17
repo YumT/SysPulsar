@@ -3,5 +3,8 @@
   "namesRefreshSec": 30,
   "disks": [],
   "kimiApiKey": "",
-  "opencodeApiKey": ""
+  "opencodeApiKey": "",
+  "openaiAdminKey": "",
+  "openaiCreditBalance": null,
+  "openaiCreditAsOf": ""
 }
