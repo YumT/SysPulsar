@@ -116,6 +116,8 @@ public sealed class UsagePanel : Grid
         // ゲージ(本数は変わり得るので差分管理)
         foreach (var g in snap.Gauges)
             sec.SetGauge(g.Label, g.Percent, g.Text, g.ResetAtUtc, ColorFor(g.Percent));
+        if (snap.GaugesAreComplete)
+            sec.RemoveGaugesExcept(snap.Gauges.Select(g => g.Label));
     }
 
     /// <summary>カウントダウン表示だけ更新する(定期呼び出し用)。</summary>
@@ -184,6 +186,17 @@ public sealed class UsagePanel : Grid
                 _gauges.Children.Add(row);
             }
             row.Set(pct, text, resetUtc, color);
+        }
+
+        /// <summary>labels に含まれないゲージ行を取り除く。</summary>
+        public void RemoveGaugesExcept(IEnumerable<string> labels)
+        {
+            var keep = labels.ToHashSet();
+            foreach (var label in _rows.Keys.Where(l => !keep.Contains(l)).ToList())
+            {
+                _gauges.Children.Remove(_rows[label]);
+                _rows.Remove(label);
+            }
         }
 
         public void Tick()

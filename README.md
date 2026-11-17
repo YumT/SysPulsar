@@ -115,7 +115,10 @@
 (KimiCreditWatcher の UsageWatcher から移植。単体版と同等の取得仕様)。
 
 - **表示**: プロバイダ毎にゲージ(ラベル+% / バー / リセット時刻+カウントダウン)
-  - Claude: Current session / All models
+  - Claude: Current session / All models / Fable
+    (Fable は週のモデル別枠。応答の `limits[]` に `kind: "weekly_scoped"` かつ
+    `scope.model.display_name` が Fable の行があるときだけ表示。
+    他のモデル別枠は出さない。応答から枠が消えたら行も消える)
   - Kimi: 5-hour usage / 7-day usage / Total usage(取れるものだけ表示)
 - **色分け**: 50% 未満=緑、50% 以上=橙、80% 以上=赤(しきい値は設定で変更可)
 - **ポーリング**: 120 秒周期(下限 30 秒)をプロバイダ毎にバックグラウンドで実行。

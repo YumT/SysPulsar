@@ -24,6 +24,14 @@ public sealed class UsageSnapshot
     /// <summary>未ログイン・トークン失効など。認証の「読むだけ」原則により警告表示のみ。</summary>
     public string? AuthMessage { get; set; }
 
+    /// <summary>
+    /// true のとき Gauges は応答に含まれる全枠を表す(一部だけ取れた状態ではない)。
+    /// 表示側はこのスナップショットに無いゲージ行を消す。応答に出たり消えたりする枠
+    /// (Claude の週のモデル別枠など)で古い値が残り続けないようにするため。
+    /// 取得に成功したときだけ立てる(認証エラー等では立てず、直前の表示を残す)。
+    /// </summary>
+    public bool GaugesAreComplete { get; set; }
+
     public DateTimeOffset FetchedAt { get; set; } = DateTimeOffset.Now;
 
     public double WorstPercent => Gauges.Count == 0 ? 0 : Gauges.Max(g => g.Percent);

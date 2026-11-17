@@ -5,6 +5,7 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 
 namespace SysPulsar.App.Usage;
 
@@ -26,7 +27,11 @@ public interface IUsageProvider
 /// Claude Code (Max/Pro) の使用量。
 /// GET https://api.anthropic.com/api/oauth/usage
 /// 認証: ~/.claude/.credentials.json → claudeAiOauth.accessToken（読むだけ）
-/// 抽出: limits[] 配列のみ（トップレベルの重複キーは見ない）。
+/// 抽出: limits[] 配列のみ（トップレベルの重複キーは見ない）。行の種類は kind で判定する:
+///   session       … Current session(5時間枠)
+///   weekly_all    … All models(週の全モデル枠)
+///   weekly_scoped … 週のモデル別/サーフェス別の枠。scope.model.display_name にモデル名
+///                   (例: "Fable")が入る。表示するのは ShownScopedModel に合うモデルだけ
 /// ※ 非公式API。スキーマ変更時は --debug の生JSONで確認して本クラスを直す。
 /// </summary>
 public sealed class ClaudeProvider : IUsageProvider
@@ -38,6 +43,14 @@ public sealed class ClaudeProvider : IUsageProvider
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", ".credentials.json");
 
     const string UsageUrl = "https://api.anthropic.com/api/oauth/usage";
+
+    /// <summary>
+    /// weekly_scoped(週のモデル別枠)のうち表示するモデル。scope.model.display_name の
+    /// 先頭語で判定する(Claude Code 本体も Fable 枠を /^fable\b/i で判定している)。
+    /// 他のモデル別枠は下段の高さ節約のため出さない。
+    /// </summary>
+    static readonly Regex ShownScopedModel =
+        new(@"^fable\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
     public async Task<UsageSnapshot> FetchAsync(HttpClient http, CancellationToken ct)
     {
@@ -92,39 +105,68 @@ public sealed class ClaudeProvider : IUsageProvider
         res.EnsureSuccessStatusCode();
 
         using var json = JsonDocument.Parse(body);
-        if (json.RootElement.TryGetProperty("limits", out var limits) &&
-            limits.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var lim in limits.EnumerateArray())
-            {
-                var kind = lim.TryGetProperty("kind", out var k) ? k.GetString() : null;
-                var pct = lim.TryGetProperty("percent", out var p) && p.ValueKind == JsonValueKind.Number
-                    ? p.GetDouble() : 0;
-                DateTimeOffset? reset = null;
-                if (lim.TryGetProperty("resets_at", out var r) &&
-                    r.ValueKind == JsonValueKind.String &&
-                    DateTimeOffset.TryParse(r.GetString(), CultureInfo.InvariantCulture,
-                        DateTimeStyles.AssumeUniversal, out var dto))
-                    reset = dto;
-
-                // 表示対象は Current session / All models の2本（週・モデル別は出さない）
-                var label = kind switch
-                {
-                    "session" => "Current session",
-                    "weekly_all" => "All models",
-                    _ => null,
-                };
-                if (label == null) continue;
-
-                snap.Gauges.Add(new GaugeInfo
-                {
-                    Label = label,
-                    Percent = pct,
-                    ResetAtUtc = reset,
-                });
-            }
-        }
+        ParseLimits(json.RootElement, snap);
+        // 応答は毎回すべての枠を返すので、今回出てこなかった枠(例: Fable 枠が
+        // 応答から消えた)は表示側で消してよい。古い値が残り続けるのを防ぐ
+        snap.GaugesAreComplete = true;
         return snap;
+    }
+
+    /// <summary>
+    /// /api/oauth/usage のレスポンスから表示対象の枠を抽出する。
+    /// 表示対象は Current session / All models / Fable(週のモデル別枠)。
+    /// </summary>
+    internal static void ParseLimits(JsonElement root, UsageSnapshot snap)
+    {
+        if (!root.TryGetProperty("limits", out var limits) ||
+            limits.ValueKind != JsonValueKind.Array)
+            return;
+
+        foreach (var lim in limits.EnumerateArray())
+        {
+            if (lim.ValueKind != JsonValueKind.Object) continue;
+            var kind = lim.TryGetProperty("kind", out var k) && k.ValueKind == JsonValueKind.String
+                ? k.GetString() : null;
+
+            var label = kind switch
+            {
+                "session" => "Current session",
+                "weekly_all" => "All models",
+                "weekly_scoped" => ScopedModelLabel(lim),
+                _ => null,
+            };
+            if (label == null) continue;
+
+            var pct = lim.TryGetProperty("percent", out var p) && p.ValueKind == JsonValueKind.Number
+                ? p.GetDouble() : 0;
+            DateTimeOffset? reset = null;
+            if (lim.TryGetProperty("resets_at", out var r) &&
+                r.ValueKind == JsonValueKind.String &&
+                DateTimeOffset.TryParse(r.GetString(), CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal, out var dto))
+                reset = dto;
+
+            snap.Gauges.Add(new GaugeInfo
+            {
+                Label = label,
+                Percent = pct,
+                ResetAtUtc = reset,
+            });
+        }
+    }
+
+    /// <summary>
+    /// weekly_scoped 行のモデル名(scope.model.display_name)をラベルとして返す。
+    /// サーフェス別の枠(scope.surface)や表示対象外のモデルなら null。
+    /// </summary>
+    static string? ScopedModelLabel(JsonElement lim)
+    {
+        if (!lim.TryGetProperty("scope", out var scope) || scope.ValueKind != JsonValueKind.Object ||
+            !scope.TryGetProperty("model", out var model) || model.ValueKind != JsonValueKind.Object ||
+            !model.TryGetProperty("display_name", out var dn) || dn.ValueKind != JsonValueKind.String)
+            return null;
+        var name = dn.GetString()?.Trim();
+        return !string.IsNullOrEmpty(name) && ShownScopedModel.IsMatch(name) ? name : null;
     }
 
     internal static RateLimitException RateLimited(HttpResponseMessage res)
